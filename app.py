@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """
-Flock Phase 1 — live site, simulated follows.
+Flock Phase 1 — Vercel-compatible (SQLite in /tmp on Vercel).
 
-Real: usernames, sessions, PIN login, credits, hourly reset, member pool.
-Not live: X OAuth / real follows (that's Phase 2).
-
-  pip install flask
-  FLOCK_SECRET='a-long-random-string' python3 app.py
-
-  Demo hour: FLOCK_HOUR=80 python3 app.py
-  Production: gunicorn -b 0.0.0.0:3333 -w 1 app:app
+  Local:  FLOCK_SECRET='...' python3 app.py
+  Vercel: set FLOCK_SECRET in project env vars, then redeploy
 """
 
 from __future__ import annotations
@@ -27,9 +21,16 @@ MAX_CREDITS = 10
 HOUR_SECONDS = int(os.environ.get("FLOCK_HOUR", "3600"))
 FOLLOW_GAP_SECONDS = 1.2
 PIN_TTL = 7200
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flock.db")
 
-# Shown until real people sign up. New logins join the live pool.
+# Vercel filesystem is read-only except /tmp
+_IS_VERCEL = bool(os.environ.get("VERCEL"))
+DB_PATH = os.environ.get(
+    "FLOCK_DB",
+    "/tmp/flock.db"
+    if _IS_VERCEL
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "flock.db"),
+)
+
 SEED = [
     ("mira_field", "Mira Field", "Design systems · slow tech"),
     ("northlane", "North Lane", "Markets, maps, morning notes"),
@@ -47,13 +48,17 @@ SEED = [
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+app.permanent_session_lifetime = 60 * 60 * 24 * 30
 
 
 def db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH, timeout=30)
         g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA journal_mode=WAL")
+        try:
+            g.db.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
     return g.db
 
 
@@ -65,6 +70,9 @@ def close_db(_exc):
 
 
 def init_db():
+    parent = os.path.dirname(DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(
         """
@@ -143,7 +151,6 @@ def upsert_user(handle: str):
 
 
 def live_pool(exclude: str):
-    """Real signups first; seed fills the list so Start always has targets."""
     rows = db().execute(
         "SELECT handle, name, bio FROM users WHERE handle != ? ORDER BY last_seen DESC",
         (exclude,),
@@ -226,15 +233,7 @@ def tick_follows(u):
         SET credits = ?, cursor = ?, running = ?, next_follow_at = ?, reset_at = ?, last_seen = ?
         WHERE handle = ?
         """,
-        (
-            credits,
-            u["cursor"] + 1,
-            running,
-            now + FOLLOW_GAP_SECONDS,
-            reset_at,
-            now,
-            u["handle"],
-        ),
+        (credits, u["cursor"] + 1, running, now + FOLLOW_GAP_SECONDS, reset_at, now, u["handle"]),
     )
     db().commit()
     return get_user(u["handle"])
@@ -350,7 +349,7 @@ PAGE = r"""
   <h1>Follow fellow users. Get followed back.</h1>
   <p class="muted" style="max-width:540px">
     Your handle is stored on this server. After PIN login you join the live member pool.
-    Start spends 10 credits per hour following other members. Follows are still simulated until Phase 2 (X OAuth).
+    Start spends 10 credits per hour following other members. Follows are simulated until Phase 2 (X OAuth).
   </p>
   <div class="stats">
     <div class="meter"><span class="subtle">TOTAL MEMBERS</span><b>{{ st.total }}</b></div>
@@ -454,9 +453,9 @@ def member_table_html(exclude: str | None = None) -> str:
         "<table><thead><tr><th>User</th><th>Description</th><th>Status</th></tr></thead>"
         f"<tbody>{rows}</tbody></table></div>"
         "<p class='subtle' style='margin-top:24px;max-width:640px'>"
-        "Phase 1: PIN, session, credits, and this pool are real on the server. "
+        "Phase 1: PIN, session, credits, and this pool are stored on the server. "
         "Follows are recorded here only — X is not called. "
-        f"Hour is {HOUR_SECONDS}s (FLOCK_HOUR=80 to demo).</p>"
+        f"Hour is {HOUR_SECONDS}s.</p>"
     )
 
 
@@ -566,11 +565,11 @@ def api_start():
     return jsonify(user_state(tick_follows(get_user(u["handle"]))))
 
 
-app.permanent_session_lifetime = 60 * 60 * 24 * 30  # 30 days
-
+# Vercel Python: expose the Flask app
+# (local run still works via __main__)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3333"))
-    print(f"Flock Phase 1  http://0.0.0.0:{port}  hour={HOUR_SECONDS}s")
+    print(f"Flock Phase 1  http://0.0.0.0:{port}  db={DB_PATH}")
     if SECRET_KEY == "dev-only-change-me":
         print("WARNING: set FLOCK_SECRET before public deploy.")
     app.run(host="0.0.0.0", port=port, debug=False)
