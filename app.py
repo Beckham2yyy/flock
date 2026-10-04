@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 """
-Flock Phase 1 — Vercel-compatible (SQLite in /tmp on Vercel).
-
-  Local:  FLOCK_SECRET='...' python3 app.py
-  Vercel: set FLOCK_SECRET in project env vars, then redeploy
+Flock — Toolkity-style X OAuth 1.0a PIN + 30 credits/hour.
+Vercel: set TWITTER_API_KEY, TWITTER_API_SECRET, FLOCK_SECRET then redeploy.
 """
 
 from __future__ import annotations
 
 import os
-import random
 import sqlite3
 import time
 from functools import wraps
 
+import requests
 from flask import Flask, g, jsonify, redirect, render_template_string, request, session, url_for
+from requests_oauthlib import OAuth1, OAuth1Session
 
 SECRET_KEY = os.environ.get("FLOCK_SECRET", "dev-only-change-me")
-MAX_CREDITS = 10
+TWITTER_API_KEY = os.environ.get(KBBYa09PpqRMJFQ2c7iP6vIOu)
+TWITTER_API_SECRET = os.environ.get(fncXCYchvOVRGx2nYu1NIPktIx8D1D8r538Efo9BqdiVBOzahQ)
+
+MAX_CREDITS = 30
 HOUR_SECONDS = int(os.environ.get("FLOCK_HOUR", "3600"))
-FOLLOW_GAP_SECONDS = 1.2
+FOLLOW_GAP_SECONDS = 2.0
 PIN_TTL = 7200
 
-# Vercel filesystem is read-only except /tmp
+REQUEST_TOKEN_URL = "https://api.twitter.com/oauth/request_token"
+AUTHORIZE_URL = "https://api.twitter.com/oauth/authorize"
+ACCESS_TOKEN_URL = "https://api.twitter.com/oauth/access_token"
+VERIFY_URL = "https://api.twitter.com/1.1/account/verify_credentials.json"
+FOLLOW_URL = "https://api.twitter.com/1.1/friendships/create.json"
+
 _IS_VERCEL = bool(os.environ.get("VERCEL"))
 DB_PATH = os.environ.get(
     "FLOCK_DB",
@@ -82,7 +89,11 @@ def init_db():
             bio TEXT,
             pin TEXT,
             pin_at REAL,
-            credits INTEGER NOT NULL DEFAULT 10,
+            req_token TEXT,
+            req_secret TEXT,
+            access_token TEXT,
+            access_secret TEXT,
+            credits INTEGER NOT NULL DEFAULT 30,
             reset_at REAL,
             running INTEGER NOT NULL DEFAULT 0,
             next_follow_at REAL,
@@ -95,16 +106,34 @@ def init_db():
             handle TEXT NOT NULL,
             target TEXT NOT NULL,
             name TEXT NOT NULL,
-            at REAL NOT NULL
+            at REAL NOT NULL,
+            real INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS follows_handle ON follows(handle, id DESC);
         """
     )
+    # Soft-migrate older Phase-1 tables
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    for col, typ in [
+        ("req_token", "TEXT"),
+        ("req_secret", "TEXT"),
+        ("access_token", "TEXT"),
+        ("access_secret", "TEXT"),
+    ]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+    fcols = {r[1] for r in conn.execute("PRAGMA table_info(follows)").fetchall()}
+    if "real" not in fcols:
+        conn.execute("ALTER TABLE follows ADD COLUMN real INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     conn.close()
 
 
 init_db()
+
+
+def twitter_configured() -> bool:
+    return bool(TWITTER_API_KEY and TWITTER_API_SECRET)
 
 
 def login_required(fn):
@@ -119,10 +148,6 @@ def login_required(fn):
 
 def sanitize(raw: str) -> str:
     return "".join(c for c in (raw or "").lstrip("@") if c.isalnum() or c == "_")[:15]
-
-
-def mint_pin() -> str:
-    return str(random.randint(1_000_000, 9_999_999))
 
 
 def fmt(seconds: float) -> str:
@@ -197,6 +222,31 @@ def apply_reset(u):
     return u
 
 
+def x_follow(u, screen_name: str) -> tuple[bool, str]:
+    """Attempt real follow via OAuth 1.0a user tokens. Returns (ok, detail)."""
+    if not u["access_token"] or not u["access_secret"]:
+        return False, "not linked"
+    auth = OAuth1(
+        TWITTER_API_KEY,
+        TWITTER_API_SECRET,
+        u["access_token"],
+        u["access_secret"],
+    )
+    try:
+        r = requests.post(
+            FOLLOW_URL,
+            params={"screen_name": screen_name, "follow": "false"},
+            auth=auth,
+            timeout=20,
+        )
+        if r.status_code in (200, 403):
+            # 403 often means already following
+            return True, "ok"
+        return False, f"{r.status_code}: {r.text[:120]}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
 def tick_follows(u):
     u = apply_reset(u)
     now = time.time()
@@ -220,9 +270,10 @@ def tick_follows(u):
         return get_user(u["handle"])
 
     member = pool[u["cursor"] % len(pool)]
+    real_ok, _detail = x_follow(u, member[0])
     db().execute(
-        "INSERT INTO follows (handle, target, name, at) VALUES (?, ?, ?, ?)",
-        (u["handle"], member[0], member[1], now),
+        "INSERT INTO follows (handle, target, name, at, real) VALUES (?, ?, ?, ?, ?)",
+        (u["handle"], member[0], member[1], now, 1 if real_ok else 0),
     )
     credits = u["credits"] - 1
     running = 1 if credits > 0 else 0
@@ -243,13 +294,14 @@ def user_state(u):
     now = time.time()
     remain = max(0.0, (u["reset_at"] or 0) - now) if u["reset_at"] else 0.0
     follows = db().execute(
-        "SELECT target, name, at FROM follows WHERE handle = ? ORDER BY id DESC LIMIT 40",
+        "SELECT target, name, at, real FROM follows WHERE handle = ? ORDER BY id DESC LIMIT 40",
         (u["handle"],),
     ).fetchall()
     last = follows[0] if follows else None
     msg = ""
     if last:
-        msg = f"{u['handle']} followed @{last['target']}"
+        tag = "on X" if last["real"] else "in pool log"
+        msg = f"{u['handle']} followed @{last['target']} ({tag})"
         if u["credits"] <= 0:
             msg += ". Batch done. Stay on this page until Remaining Time hits 0."
     elif u["running"]:
@@ -264,6 +316,7 @@ def user_state(u):
         "message": msg,
         "hour": HOUR_SECONDS,
         "stats": stats(),
+        "linked": bool(u["access_token"]),
     }
 
 
@@ -285,6 +338,7 @@ PAGE = r"""
   body { margin:0; background:var(--bg); color:var(--fg); font-family:Outfit,system-ui,sans-serif; }
   h1,h2,h3 { font-family:Fraunces,Georgia,serif; font-weight:500; }
   a { color:inherit; text-decoration:none; }
+  a.link { color:var(--primary); text-decoration:underline; }
   .wrap { max-width:960px; margin:0 auto; padding:0 16px 80px; }
   header { position:sticky; top:0; z-index:10; backdrop-filter:blur(10px); background:rgba(11,16,23,.85); border-bottom:1px solid rgba(243,236,225,.08); }
   header .bar { max-width:960px; margin:0 auto; height:56px; display:flex; align-items:center; justify-content:space-between; padding:0 16px; }
@@ -306,7 +360,7 @@ PAGE = r"""
   button:disabled { opacity:.45; cursor:not-allowed; }
   button.ghost { background:transparent; color:var(--muted); height:36px; }
   button.full { width:100%; margin-top:14px; }
-  .pin { font-family:Fraunces,serif; font-size:32px; letter-spacing:.2em; margin:8px 0 0; }
+  .pin { font-family:Fraunces,serif; font-size:20px; letter-spacing:.04em; margin:8px 0 0; word-break:break-all; }
   .meters { display:grid; gap:12px; margin:28px 0 12px; }
   @media (min-width:700px) { .meters { grid-template-columns:repeat(3,1fr); } }
   .meter { background:var(--surface); border-radius:16px; padding:16px; box-shadow:0 0 0 1px rgba(243,236,225,.08); }
@@ -345,12 +399,15 @@ PAGE = r"""
 
 {% if not handle %}
 <main class="wrap" style="padding-top:40px">
-  <p class="kicker">Member exchange · Phase 1</p>
+  <p class="kicker">Member exchange · X authorize</p>
   <h1>Follow fellow users. Get followed back.</h1>
   <p class="muted" style="max-width:540px">
-    Your handle is stored on this server. After PIN login you join the live member pool.
-    Start spends 10 credits per hour following other members. Follows are simulated until Phase 2 (X OAuth).
+    Step 1 opens X authorize (same flow as Toolkity). Authorize the app, copy the 7-digit PIN X shows, paste it in Step 2.
+    Start uses <strong>{{ max_credits }} credits per hour</strong>.
   </p>
+  {% if not twitter_ok %}
+  <p class="err">Server missing TWITTER_API_KEY / TWITTER_API_SECRET — set them in Vercel env vars.</p>
+  {% endif %}
   <div class="stats">
     <div class="meter"><span class="subtle">TOTAL MEMBERS</span><b>{{ st.total }}</b></div>
     <div class="meter"><span class="subtle">ACTIVE</span><b>{{ st.active }}</b></div>
@@ -359,27 +416,27 @@ PAGE = r"""
   <div class="grid2">
     <div class="card">
       <p class="subtle">STEP 1</p>
-      <h2>Get a PIN</h2>
+      <h2>Get PIN code on X</h2>
       <form method="post" action="{{ url_for('mint') }}">
-        <label for="uh">Your X username</label>
+        <label for="uh">Your X username (for display)</label>
         <div class="handle"><span>@</span>
           <input id="uh" name="handle" value="{{ form_handle }}" placeholder="yourhandle" autocomplete="username" required/>
         </div>
-        <button class="full" type="submit">Get PIN code</button>
+        <button class="full" type="submit" {% if not twitter_ok %}disabled{% endif %}>Get Pin Code On Twitter</button>
       </form>
-      {% if issued_pin %}
+      {% if auth_url %}
         <div class="card" style="background:var(--elevated);margin-top:16px;padding:16px">
-          <p class="subtle">Your PIN (expires in 2 hours)</p>
-          <p class="pin">{{ issued_pin }}</p>
+          <p class="subtle">Open this link while logged into X, tap Authorize app, then copy the PIN:</p>
+          <p class="pin"><a class="link" href="{{ auth_url }}" target="_blank" rel="noopener">{{ auth_url }}</a></p>
         </div>
       {% endif %}
     </div>
     <div class="card">
       <p class="subtle">STEP 2</p>
-      <h2>Enter PIN, then login</h2>
+      <h2>Enter the PIN, then login</h2>
       <form method="post" action="{{ url_for('login') }}">
         <input type="hidden" name="handle" value="{{ form_handle }}"/>
-        <label for="pin">PIN code</label>
+        <label for="pin">PIN code from X</label>
         <input id="pin" name="pin" inputmode="numeric" maxlength="7" placeholder="7 digits" required/>
         <button class="full" type="submit">Login</button>
       </form>
@@ -389,9 +446,9 @@ PAGE = r"""
   </div>
   <h2 style="margin-top:56px">How it works</h2>
   <div class="how">
-    <div class="card"><p class="kicker">01</p><h3>PIN session</h3><p class="muted">No X password. A 7-digit PIN binds this browser to your handle on the server.</p></div>
-    <div class="card"><p class="kicker">02</p><h3>You join the pool</h3><p class="muted">After login you are a live member. Other people who Start will “follow” you in the exchange log.</p></div>
-    <div class="card"><p class="kicker">03</p><h3>10 credits / hour</h3><p class="muted">Start spends credits. Remaining Time refills them. Keep the dashboard open.</p></div>
+    <div class="card"><p class="kicker">01</p><h3>Authorize on X</h3><p class="muted">Same as Toolkity: request token → authorize URL → 7-digit PIN from X.</p></div>
+    <div class="card"><p class="kicker">02</p><h3>You join the pool</h3><p class="muted">After PIN login your handle is a live member others can follow.</p></div>
+    <div class="card"><p class="kicker">03</p><h3>{{ max_credits }} credits / hour</h3><p class="muted">Start spends credits. Remaining Time refills them. Keep the dashboard open.</p></div>
   </div>
   {{ member_table|safe }}
 </main>
@@ -399,7 +456,10 @@ PAGE = r"""
 <main class="wrap" style="padding-top:32px">
   <p class="kicker">Dashboard</p>
   <h1>Free X Followers</h1>
-  <p class="muted">Credits live on the server. Start follows other Flock members (simulated in Phase 1).</p>
+  <p class="muted">
+    {{ max_credits }} credits / hour.
+    {% if state.linked %}X account linked via OAuth.{% else %}Session only — re-authorize for real follows.{% endif %}
+  </p>
   <div class="meters">
     <div class="meter"><span class="subtle">CREDIT</span><b id="credits">{{ state.credits }}</b><span class="subtle">of {{ max_credits }} this hour</span></div>
     <div class="meter"><span class="subtle">REMAINING TIME</span><b id="remain">{{ state.remain_label }}</b><span class="subtle">until credits refill</span></div>
@@ -427,7 +487,7 @@ function render(s){
     ? 'Wait for Remaining Time. Keep this dashboard open.'
     : (s.running ? ('Following members… ' + s.credits + ' left') : ('Uses up to ' + s.credits + ' credits.'));
   document.getElementById('log').innerHTML = s.follows.length
-    ? s.follows.map(f => '<li><div><strong>@'+f.target+'</strong><div class="subtle">'+f.name+'</div></div><span class="ok">Followed</span></li>').join('')
+    ? s.follows.map(f => '<li><div><strong>@'+f.target+'</strong><div class="subtle">'+f.name+(f.real?' · X':' · log')+'</div></div><span class="ok">Followed</span></li>').join('')
     : '<li class="muted">Press Start to follow the next member in the pool.</li>';
 }
 async function pull(){ render(await (await fetch('/api/state')).json()); }
@@ -453,9 +513,9 @@ def member_table_html(exclude: str | None = None) -> str:
         "<table><thead><tr><th>User</th><th>Description</th><th>Status</th></tr></thead>"
         f"<tbody>{rows}</tbody></table></div>"
         "<p class='subtle' style='margin-top:24px;max-width:640px'>"
-        "Phase 1: PIN, session, credits, and this pool are stored on the server. "
-        "Follows are recorded here only — X is not called. "
-        f"Hour is {HOUR_SECONDS}s.</p>"
+        "Authorize via X PIN (OAuth 1.0a). "
+        f"{MAX_CREDITS} credits / hour ({HOUR_SECONDS}s). "
+        "Real follows use the X API when your plan allows them.</p>"
     )
 
 
@@ -473,17 +533,18 @@ def home():
                 hour=HOUR_SECONDS,
                 member_table=member_table_html(u["handle"]),
                 form_handle="",
-                issued_pin=None,
+                auth_url=None,
                 error=None,
                 info=None,
                 st=stats(),
+                twitter_ok=twitter_configured(),
             )
         session.clear()
     return render_template_string(
         PAGE,
         handle=None,
         form_handle=session.get("pending_handle", ""),
-        issued_pin=session.get("issued_pin"),
+        auth_url=session.get("auth_url"),
         error=request.args.get("error"),
         info=request.args.get("info"),
         member_table=member_table_html(),
@@ -491,42 +552,139 @@ def home():
         hour=HOUR_SECONDS,
         state=None,
         st=stats(),
+        twitter_ok=twitter_configured(),
     )
 
 
 @app.post("/mint")
 def mint():
+    if not twitter_configured():
+        return redirect(url_for("home", error="Twitter API keys not configured on server."))
     handle = sanitize(request.form.get("handle", ""))
     if len(handle) < 2:
         return redirect(url_for("home", error="Enter your X username."))
-    pin = mint_pin()
+
+    oauth = OAuth1Session(
+        TWITTER_API_KEY,
+        client_secret=TWITTER_API_SECRET,
+        callback_uri="oob",
+    )
+    try:
+        tokens = oauth.fetch_request_token(REQUEST_TOKEN_URL)
+    except Exception as e:
+        return redirect(url_for("home", error=f"Could not start X authorize: {e}"))
+
+    req_token = tokens.get("oauth_token")
+    req_secret = tokens.get("oauth_token_secret")
+    auth_url = f"{AUTHORIZE_URL}?oauth_token={req_token}"
+
     upsert_user(handle)
     db().execute(
-        "UPDATE users SET pin = ?, pin_at = ? WHERE handle = ?",
-        (pin, time.time(), handle),
+        """
+        UPDATE users
+        SET req_token = ?, req_secret = ?, pin = NULL, pin_at = ?, last_seen = ?
+        WHERE handle = ?
+        """,
+        (req_token, req_secret, time.time(), time.time(), handle),
     )
     db().commit()
+
     session["pending_handle"] = handle
-    session["issued_pin"] = pin
-    return redirect(url_for("home", info="PIN ready. Enter it in step 2. You are in the member pool."))
+    session["auth_url"] = auth_url
+    session["req_token"] = req_token
+    return redirect(
+        url_for(
+            "home",
+            info="Open the authorize link, tap Authorize app on X, then enter the PIN below.",
+        )
+    )
 
 
 @app.post("/login")
 def login():
+    if not twitter_configured():
+        return redirect(url_for("home", error="Twitter API keys not configured on server."))
+
     handle = sanitize(request.form.get("handle") or session.get("pending_handle", ""))
     pin = "".join(c for c in (request.form.get("pin") or "") if c.isdigit())[:7]
-    u = get_user(handle) if handle else None
-    if not u:
-        return redirect(url_for("home", error="Get a PIN first."))
-    if not u["pin"] or pin != u["pin"]:
-        return redirect(url_for("home", error="Wrong or expired PIN."))
+    if not handle or len(pin) < 6:
+        return redirect(url_for("home", error="Enter the 7-digit PIN from X."))
+
+    u = get_user(handle)
+    if not u or not u["req_token"] or not u["req_secret"]:
+        return redirect(url_for("home", error="Get a PIN link first (Step 1)."))
+
     if u["pin_at"] and time.time() - u["pin_at"] > PIN_TTL:
-        return redirect(url_for("home", error="PIN expired. Get a new one."))
-    db().execute(
-        "UPDATE users SET pin = NULL, last_seen = ? WHERE handle = ?",
-        (time.time(), handle),
+        return redirect(url_for("home", error="Authorize link expired. Start Step 1 again."))
+
+    oauth = OAuth1Session(
+        TWITTER_API_KEY,
+        client_secret=TWITTER_API_SECRET,
+        resource_owner_key=u["req_token"],
+        resource_owner_secret=u["req_secret"],
+        verifier=pin,
     )
-    db().commit()
+    try:
+        access = oauth.fetch_access_token(ACCESS_TOKEN_URL)
+    except Exception:
+        return redirect(url_for("home", error="Invalid or expired PIN. Authorize again."))
+
+    access_token = access.get("oauth_token")
+    access_secret = access.get("oauth_token_secret")
+    screen_name = sanitize(access.get("screen_name") or handle)
+
+    # Confirm identity
+    auth = OAuth1(TWITTER_API_KEY, TWITTER_API_SECRET, access_token, access_secret)
+    try:
+        vr = requests.get(VERIFY_URL, auth=auth, params={"skip_status": "true"}, timeout=20)
+        if vr.status_code == 200:
+            data = vr.json()
+            screen_name = sanitize(data.get("screen_name") or screen_name)
+            name = data.get("name") or screen_name
+            bio = (data.get("description") or "Flock member")[:120]
+        else:
+            name, bio = screen_name, "Flock member"
+    except Exception:
+        name, bio = screen_name, "Flock member"
+
+    now = time.time()
+    # Move row to verified handle if X returned a different screen_name
+    if screen_name != handle:
+        existing = get_user(screen_name)
+        if existing is None:
+            db().execute(
+                """
+                INSERT INTO users (
+                    handle, name, bio, access_token, access_secret,
+                    credits, created_at, last_seen, req_token, req_secret
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (screen_name, name, bio, access_token, access_secret, MAX_CREDITS, now, now),
+            )
+        else:
+            db().execute(
+                """
+                UPDATE users
+                SET name = ?, bio = ?, access_token = ?, access_secret = ?,
+                    req_token = NULL, req_secret = NULL, last_seen = ?
+                WHERE handle = ?
+                """,
+                (name, bio, access_token, access_secret, now, screen_name),
+            )
+        db().commit()
+        handle = screen_name
+    else:
+        db().execute(
+            """
+            UPDATE users
+            SET name = ?, bio = ?, access_token = ?, access_secret = ?,
+                req_token = NULL, req_secret = NULL, last_seen = ?
+            WHERE handle = ?
+            """,
+            (name, bio, access_token, access_secret, now, handle),
+        )
+        db().commit()
+
     session.clear()
     session["handle"] = handle
     session.permanent = True
@@ -565,11 +723,11 @@ def api_start():
     return jsonify(user_state(tick_follows(get_user(u["handle"]))))
 
 
-# Vercel Python: expose the Flask app
-# (local run still works via __main__)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3333"))
-    print(f"Flock Phase 1  http://0.0.0.0:{port}  db={DB_PATH}")
+    print(f"Flock  http://0.0.0.0:{port}  db={DB_PATH}  twitter={twitter_configured()}")
     if SECRET_KEY == "dev-only-change-me":
         print("WARNING: set FLOCK_SECRET before public deploy.")
+    if not twitter_configured():
+        print("WARNING: set TWITTER_API_KEY and TWITTER_API_SECRET.")
     app.run(host="0.0.0.0", port=port, debug=False)
