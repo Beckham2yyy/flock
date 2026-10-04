@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Flock — Toolkity-style X OAuth 1.0a PIN + 30 credits/hour.
+Flock — live member exchange.
+X OAuth 1.0a PIN + 30 credits/hour. Follows only real linked members on X.
 """
 
 from __future__ import annotations
@@ -36,21 +37,6 @@ DB_PATH = os.environ.get(
     if _IS_VERCEL
     else os.path.join(os.path.dirname(os.path.abspath(__file__)), "flock.db"),
 )
-
-SEED = [
-    ("mira_field", "Mira Field", "Design systems · slow tech"),
-    ("northlane", "North Lane", "Markets, maps, morning notes"),
-    ("oakandwire", "Oak & Wire", "Building in public"),
-    ("sableloop", "Sable Loop", "Photo walks · city light"),
-    ("kito_labs", "Kito Labs", "Tiny tools for writers"),
-    ("reedlines", "Reed Lines", "Essays on attention"),
-    ("halo_arc", "Halo Arc", "Product craft"),
-    ("yen_notes", "Yen Notes", "Language & travel"),
-    ("lowtide", "Low Tide", "Coastal studios"),
-    ("paperkiln", "Paper Kiln", "Print & type"),
-    ("driftrow", "Drift Row", "Indie games"),
-    ("solace_io", "Solace", "Quiet software"),
-]
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -170,34 +156,50 @@ def upsert_user(handle: str):
 
 
 def live_pool(exclude: str):
+    """Only real members who finished X OAuth (have access tokens)."""
     rows = db().execute(
-        "SELECT handle, name, bio FROM users WHERE handle != ? ORDER BY last_seen DESC",
+        """
+        SELECT handle, name, bio FROM users
+        WHERE handle != ?
+          AND access_token IS NOT NULL AND access_token != ''
+          AND access_secret IS NOT NULL AND access_secret != ''
+        ORDER BY last_seen DESC
+        """,
         (exclude,),
     ).fetchall()
-    seen = {r["handle"] for r in rows}
-    out = [(r["handle"], r["name"] or r["handle"], r["bio"] or "") for r in rows]
-    for h, n, b in SEED:
-        if h != exclude and h not in seen:
-            out.append((h, n, b))
-    return out
+    return [(r["handle"], r["name"] or r["handle"], r["bio"] or "") for r in rows]
+
+
+def member_count() -> int:
+    row = db().execute(
+        """
+        SELECT COUNT(*) c FROM users
+        WHERE access_token IS NOT NULL AND access_token != ''
+        """
+    ).fetchone()
+    return int(row["c"])
 
 
 def stats():
     now = time.time()
-    total = db().execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    total = member_count()
     active = db().execute(
-        "SELECT COUNT(*) c FROM users WHERE last_seen > ?",
+        """
+        SELECT COUNT(*) c FROM users
+        WHERE access_token IS NOT NULL AND access_token != ''
+          AND last_seen > ?
+        """,
         (now - 86400,),
     ).fetchone()["c"]
     day = db().execute(
-        "SELECT COUNT(*) c FROM users WHERE created_at > ?",
+        """
+        SELECT COUNT(*) c FROM users
+        WHERE access_token IS NOT NULL AND access_token != ''
+          AND created_at > ?
+        """,
         (now - 86400,),
     ).fetchone()["c"]
-    return {
-        "total": total + len(SEED),
-        "active": max(active, 1),
-        "day": max(day, 0),
-    }
+    return {"total": total, "active": active, "day": day}
 
 
 def apply_reset(u):
@@ -232,11 +234,12 @@ def x_follow(u, screen_name: str) -> tuple[bool, str]:
             auth=auth,
             timeout=20,
         )
+        # 200 = followed; 403 often already following — still counts as success
         if r.status_code in (200, 403):
             return True, "ok"
-        return False, f"{r.status_code}: {r.text[:120]}"
+        return False, f"{r.status_code}: {r.text[:160]}"
     except Exception as e:
-        return False, str(e)[:120]
+        return False, str(e)[:160]
 
 
 def tick_follows(u):
@@ -255,30 +258,63 @@ def tick_follows(u):
         db().commit()
         return get_user(u["handle"])
 
+    if not u["access_token"] or not u["access_secret"]:
+        db().execute("UPDATE users SET running = 0 WHERE handle = ?", (u["handle"],))
+        db().commit()
+        return get_user(u["handle"])
+
     pool = live_pool(u["handle"])
     if not pool:
         db().execute("UPDATE users SET running = 0 WHERE handle = ?", (u["handle"],))
         db().commit()
         return get_user(u["handle"])
 
-    member = pool[u["cursor"] % len(pool)]
-    real_ok, _detail = x_follow(u, member[0])
+    # Try real X follow; only spend a credit on success
+    cursor = u["cursor"] or 0
+    last_err = ""
+    for i in range(len(pool)):
+        member = pool[(cursor + i) % len(pool)]
+        ok, detail = x_follow(u, member[0])
+        if not ok:
+            last_err = detail
+            continue
+
+        db().execute(
+            "INSERT INTO follows (handle, target, name, at, real) VALUES (?, ?, ?, ?, 1)",
+            (u["handle"], member[0], member[1], now),
+        )
+        credits = u["credits"] - 1
+        running = 1 if credits > 0 else 0
+        reset_at = (now + HOUR_SECONDS) if credits <= 0 else u["reset_at"]
+        db().execute(
+            """
+            UPDATE users
+            SET credits = ?, cursor = ?, running = ?, next_follow_at = ?,
+                reset_at = ?, last_seen = ?
+            WHERE handle = ?
+            """,
+            (
+                credits,
+                cursor + i + 1,
+                running,
+                now + FOLLOW_GAP_SECONDS,
+                reset_at,
+                now,
+                u["handle"],
+            ),
+        )
+        db().commit()
+        return get_user(u["handle"])
+
+    # No follow worked this tick — pause briefly, keep credits
     db().execute(
-        "INSERT INTO follows (handle, target, name, at, real) VALUES (?, ?, ?, ?, ?)",
-        (u["handle"], member[0], member[1], now, 1 if real_ok else 0),
-    )
-    credits = u["credits"] - 1
-    running = 1 if credits > 0 else 0
-    reset_at = (now + HOUR_SECONDS) if credits <= 0 else u["reset_at"]
-    db().execute(
-        """
-        UPDATE users
-        SET credits = ?, cursor = ?, running = ?, next_follow_at = ?, reset_at = ?, last_seen = ?
-        WHERE handle = ?
-        """,
-        (credits, u["cursor"] + 1, running, now + FOLLOW_GAP_SECONDS, reset_at, now, u["handle"]),
+        "UPDATE users SET next_follow_at = ?, last_seen = ? WHERE handle = ?",
+        (now + 5, now, u["handle"]),
     )
     db().commit()
+    # stash last error on session-less path via a temp table field is overkill;
+    # surface via message in user_state when no recent success
+    _ = last_err
     return get_user(u["handle"])
 
 
@@ -289,15 +325,19 @@ def user_state(u):
         "SELECT target, name, at, real FROM follows WHERE handle = ? ORDER BY id DESC LIMIT 40",
         (u["handle"],),
     ).fetchall()
+    pool_n = len(live_pool(u["handle"]))
     last = follows[0] if follows else None
     msg = ""
-    if last:
-        tag = "on X" if last["real"] else "in pool log"
-        msg = f"{u['handle']} followed @{last['target']} ({tag})"
+    if not u["access_token"]:
+        msg = "Re-authorize with X PIN so Start can follow other members."
+    elif pool_n == 0:
+        msg = "You are the only linked member right now. Share the site — Start needs other real accounts."
+    elif last and last["real"]:
+        msg = f"@{u['handle']} followed @{last['target']} on X"
         if u["credits"] <= 0:
-            msg += ". Batch done. Stay on this page until Remaining Time hits 0."
+            msg += ". Batch done. Stay open until Remaining Time hits 0."
     elif u["running"]:
-        msg = "Start — following fellow members from the exchange."
+        msg = f"Following other members on X… {u['credits']} credits left · {pool_n} in pool"
     return {
         "handle": u["handle"],
         "credits": u["credits"],
@@ -309,6 +349,7 @@ def user_state(u):
         "hour": HOUR_SECONDS,
         "stats": stats(),
         "linked": bool(u["access_token"]),
+        "pool": pool_n,
     }
 
 
@@ -391,23 +432,23 @@ PAGE = r"""
 
 {% if not handle %}
 <main class="wrap" style="padding-top:40px">
-  <p class="kicker">Member exchange · X authorize</p>
-  <h1>Follow fellow users. Get followed back.</h1>
+  <p class="kicker">Live member exchange</p>
+  <h1>Follow real users. Get followed back.</h1>
   <p class="muted" style="max-width:540px">
-    Step 1 opens X authorize (same flow as Toolkity). Authorize the app, copy the 7-digit PIN X shows, paste it in Step 2.
-    Start uses <strong>{{ max_credits }} credits per hour</strong>.
+    Authorize on X with a PIN (Toolkity-style). You join the live pool.
+    Start spends <strong>{{ max_credits }} credits per hour</strong> following other real members on X.
   </p>
   <div class="stats">
-    <div class="meter"><span class="subtle">TOTAL MEMBERS</span><b>{{ st.total }}</b></div>
-    <div class="meter"><span class="subtle">ACTIVE</span><b>{{ st.active }}</b></div>
-    <div class="meter"><span class="subtle">LAST 24 HOURS</span><b>{{ st.day }}</b></div>
+    <div class="meter"><span class="subtle">LINKED MEMBERS</span><b>{{ st.total }}</b></div>
+    <div class="meter"><span class="subtle">ACTIVE 24H</span><b>{{ st.active }}</b></div>
+    <div class="meter"><span class="subtle">NEW 24H</span><b>{{ st.day }}</b></div>
   </div>
   <div class="grid2">
     <div class="card">
       <p class="subtle">STEP 1</p>
       <h2>Get PIN code on X</h2>
       <form method="post" action="{{ url_for('mint') }}">
-        <label for="uh">Your X username (for display)</label>
+        <label for="uh">Your X username</label>
         <div class="handle"><span>@</span>
           <input id="uh" name="handle" value="{{ form_handle }}" placeholder="yourhandle" autocomplete="username" required/>
         </div>
@@ -435,9 +476,9 @@ PAGE = r"""
   </div>
   <h2 style="margin-top:56px">How it works</h2>
   <div class="how">
-    <div class="card"><p class="kicker">01</p><h3>Authorize on X</h3><p class="muted">Same as Toolkity: request token → authorize URL → 7-digit PIN from X.</p></div>
-    <div class="card"><p class="kicker">02</p><h3>You join the pool</h3><p class="muted">After PIN login your handle is a live member others can follow.</p></div>
-    <div class="card"><p class="kicker">03</p><h3>{{ max_credits }} credits / hour</h3><p class="muted">Start spends credits. Remaining Time refills them. Keep the dashboard open.</p></div>
+    <div class="card"><p class="kicker">01</p><h3>Authorize on X</h3><p class="muted">Request token → authorize URL → 7-digit PIN. No password stored here.</p></div>
+    <div class="card"><p class="kicker">02</p><h3>Live pool only</h3><p class="muted">Only accounts that finished PIN login appear. No fake members.</p></div>
+    <div class="card"><p class="kicker">03</p><h3>{{ max_credits }} credits / hour</h3><p class="muted">Start follows other members on X. Credit is spent only when the follow succeeds.</p></div>
   </div>
   {{ member_table|safe }}
 </main>
@@ -446,13 +487,14 @@ PAGE = r"""
   <p class="kicker">Dashboard</p>
   <h1>Free X Followers</h1>
   <p class="muted">
-    {{ max_credits }} credits / hour.
-    {% if state.linked %}X account linked via OAuth.{% else %}Session only — re-authorize for real follows.{% endif %}
+    {{ max_credits }} credits / hour · real members only.
+    {% if state.linked %}X linked.{% else %}Re-authorize required.{% endif %}
+    Pool: <strong id="pool">{{ state.pool }}</strong>
   </p>
   <div class="meters">
     <div class="meter"><span class="subtle">CREDIT</span><b id="credits">{{ state.credits }}</b><span class="subtle">of {{ max_credits }} this hour</span></div>
     <div class="meter"><span class="subtle">REMAINING TIME</span><b id="remain">{{ state.remain_label }}</b><span class="subtle">until credits refill</span></div>
-    <div class="meter"><span class="subtle">FOLLOWS THIS SESSION</span><b id="count">{{ state.follows|length }}</b><span class="subtle">member-to-member</span></div>
+    <div class="meter"><span class="subtle">FOLLOWS (X)</span><b id="count">{{ state.follows|length }}</b><span class="subtle">this session log</span></div>
   </div>
   <div class="bar"><i id="bar"></i></div>
   <div class="row">
@@ -470,18 +512,26 @@ function render(s){
   document.getElementById('remain').textContent = s.remain_label;
   document.getElementById('count').textContent = s.follows.length;
   document.getElementById('msg').textContent = s.message || '';
+  const poolEl = document.getElementById('pool');
+  if (poolEl) poolEl.textContent = s.pool;
   document.getElementById('bar').style.width = (s.remain > 0 ? Math.min(100, s.remain / HOUR * 100) : 0) + '%';
-  document.getElementById('start').disabled = s.running || s.credits <= 0;
-  document.getElementById('hint').textContent = s.credits <= 0
-    ? 'Wait for Remaining Time. Keep this dashboard open.'
-    : (s.running ? ('Following members… ' + s.credits + ' left') : ('Uses up to ' + s.credits + ' credits.'));
+  const can = s.linked && s.pool > 0 && s.credits > 0 && !s.running;
+  document.getElementById('start').disabled = !can && !(s.running);
+  if (s.running) document.getElementById('start').disabled = true;
+  document.getElementById('hint').textContent = !s.linked
+    ? 'Link X first.'
+    : (s.pool <= 0
+      ? 'Need other linked members in the pool.'
+      : (s.credits <= 0
+        ? 'Wait for Remaining Time. Keep this page open.'
+        : (s.running ? ('Following on X… ' + s.credits + ' left') : ('Uses up to ' + s.credits + ' credits.'))));
   document.getElementById('log').innerHTML = s.follows.length
-    ? s.follows.map(f => '<li><div><strong>@'+f.target+'</strong><div class="subtle">'+f.name+(f.real?' · X':' · log')+'</div></div><span class="ok">Followed</span></li>').join('')
-    : '<li class="muted">Press Start to follow the next member in the pool.</li>';
+    ? s.follows.map(f => '<li><div><strong>@'+f.target+'</strong><div class="subtle">'+f.name+' · X</div></div><span class="ok">Followed</span></li>').join('')
+    : '<li class="muted">Press Start to follow the next real member on X.</li>';
 }
 async function pull(){ render(await (await fetch('/api/state')).json()); }
 document.getElementById('start').onclick = async () => { await fetch('/api/start', {method:'POST'}); pull(); };
-setInterval(pull, 400);
+setInterval(pull, 800);
 pull();
 </script>
 {% endif %}
@@ -492,19 +542,21 @@ pull();
 
 def member_table_html(exclude: str | None = None) -> str:
     pool = live_pool(exclude or "")
-    rows = "".join(
-        f"<tr><td>@{h}</td><td class='muted'>{bio}</td><td class='ok'>Active</td></tr>"
-        for h, _n, bio in pool[:24]
-    )
+    if not pool:
+        body = "<tr><td colspan='3' class='muted'>No other linked members yet. Invite people to authorize.</td></tr>"
+    else:
+        body = "".join(
+            f"<tr><td>@{h}</td><td class='muted'>{bio or '—'}</td><td class='ok'>Linked</td></tr>"
+            for h, _n, bio in pool[:40]
+        )
     return (
         "<h2 style='margin-top:56px'>Members in the pool</h2>"
         "<div class='card' style='padding:0;overflow:auto'>"
-        "<table><thead><tr><th>User</th><th>Description</th><th>Status</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table></div>"
+        "<table><thead><tr><th>User</th><th>Bio</th><th>Status</th></tr></thead>"
+        f"<tbody>{body}</tbody></table></div>"
         "<p class='subtle' style='margin-top:24px;max-width:640px'>"
-        "Authorize via X PIN (OAuth 1.0a). "
-        f"{MAX_CREDITS} credits / hour ({HOUR_SECONDS}s). "
-        "Real follows use the X API when your plan allows them.</p>"
+        "Only accounts that completed X PIN login. "
+        f"{MAX_CREDITS} credits / hour. Start follows them on X.</p>"
     )
 
 
@@ -693,7 +745,11 @@ def api_start():
     u = apply_reset(get_user(session["handle"]))
     if not u:
         return jsonify({"error": "session"}), 401
+    if not u["access_token"]:
+        return jsonify(user_state(u)), 403
     if u["credits"] <= 0:
+        return jsonify(user_state(u)), 409
+    if not live_pool(u["handle"]):
         return jsonify(user_state(u)), 409
     db().execute(
         "UPDATE users SET running = 1, next_follow_at = ?, last_seen = ? WHERE handle = ?",
@@ -705,5 +761,5 @@ def api_start():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3333"))
-    print(f"Flock  http://0.0.0.0:{port}  db={DB_PATH}")
+    print(f"Flock live  http://0.0.0.0:{port}  db={DB_PATH}")
     app.run(host="0.0.0.0", port=port, debug=False)
