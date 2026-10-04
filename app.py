@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Flock — Toolkity-style X OAuth 1.0a PIN + 30 credits/hour.
-Vercel: set TWITTER_API_KEY, TWITTER_API_SECRET, FLOCK_SECRET then redeploy.
 """
 
 from __future__ import annotations
@@ -16,8 +15,8 @@ from flask import Flask, g, jsonify, redirect, render_template_string, request, 
 from requests_oauthlib import OAuth1, OAuth1Session
 
 SECRET_KEY = os.environ.get("FLOCK_SECRET", "dev-only-change-me")
-TWITTER_API_KEY = os.environ.get(KBBYa09PpqRMJFQ2c7iP6vIOu)
-TWITTER_API_SECRET = os.environ.get(fncXCYchvOVRGx2nYu1NIPktIx8D1D8r538Efo9BqdiVBOzahQ)
+TWITTER_API_KEY = "KBBYa09PpqRMJFQ2c7iP6vIOu"
+TWITTER_API_SECRET = "fncXCYchvOVRGx2nYu1NIPktIx8D1D8r538Efo9BqdiVBOzahQ"
 
 MAX_CREDITS = 30
 HOUR_SECONDS = int(os.environ.get("FLOCK_HOUR", "3600"))
@@ -112,7 +111,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS follows_handle ON follows(handle, id DESC);
         """
     )
-    # Soft-migrate older Phase-1 tables
     cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
     for col, typ in [
         ("req_token", "TEXT"),
@@ -130,10 +128,6 @@ def init_db():
 
 
 init_db()
-
-
-def twitter_configured() -> bool:
-    return bool(TWITTER_API_KEY and TWITTER_API_SECRET)
 
 
 def login_required(fn):
@@ -223,7 +217,6 @@ def apply_reset(u):
 
 
 def x_follow(u, screen_name: str) -> tuple[bool, str]:
-    """Attempt real follow via OAuth 1.0a user tokens. Returns (ok, detail)."""
     if not u["access_token"] or not u["access_secret"]:
         return False, "not linked"
     auth = OAuth1(
@@ -240,7 +233,6 @@ def x_follow(u, screen_name: str) -> tuple[bool, str]:
             timeout=20,
         )
         if r.status_code in (200, 403):
-            # 403 often means already following
             return True, "ok"
         return False, f"{r.status_code}: {r.text[:120]}"
     except Exception as e:
@@ -405,9 +397,6 @@ PAGE = r"""
     Step 1 opens X authorize (same flow as Toolkity). Authorize the app, copy the 7-digit PIN X shows, paste it in Step 2.
     Start uses <strong>{{ max_credits }} credits per hour</strong>.
   </p>
-  {% if not twitter_ok %}
-  <p class="err">Server missing TWITTER_API_KEY / TWITTER_API_SECRET — set them in Vercel env vars.</p>
-  {% endif %}
   <div class="stats">
     <div class="meter"><span class="subtle">TOTAL MEMBERS</span><b>{{ st.total }}</b></div>
     <div class="meter"><span class="subtle">ACTIVE</span><b>{{ st.active }}</b></div>
@@ -422,7 +411,7 @@ PAGE = r"""
         <div class="handle"><span>@</span>
           <input id="uh" name="handle" value="{{ form_handle }}" placeholder="yourhandle" autocomplete="username" required/>
         </div>
-        <button class="full" type="submit" {% if not twitter_ok %}disabled{% endif %}>Get Pin Code On Twitter</button>
+        <button class="full" type="submit">Get Pin Code On Twitter</button>
       </form>
       {% if auth_url %}
         <div class="card" style="background:var(--elevated);margin-top:16px;padding:16px">
@@ -537,7 +526,6 @@ def home():
                 error=None,
                 info=None,
                 st=stats(),
-                twitter_ok=twitter_configured(),
             )
         session.clear()
     return render_template_string(
@@ -552,14 +540,11 @@ def home():
         hour=HOUR_SECONDS,
         state=None,
         st=stats(),
-        twitter_ok=twitter_configured(),
     )
 
 
 @app.post("/mint")
 def mint():
-    if not twitter_configured():
-        return redirect(url_for("home", error="Twitter API keys not configured on server."))
     handle = sanitize(request.form.get("handle", ""))
     if len(handle) < 2:
         return redirect(url_for("home", error="Enter your X username."))
@@ -602,9 +587,6 @@ def mint():
 
 @app.post("/login")
 def login():
-    if not twitter_configured():
-        return redirect(url_for("home", error="Twitter API keys not configured on server."))
-
     handle = sanitize(request.form.get("handle") or session.get("pending_handle", ""))
     pin = "".join(c for c in (request.form.get("pin") or "") if c.isdigit())[:7]
     if not handle or len(pin) < 6:
@@ -633,7 +615,6 @@ def login():
     access_secret = access.get("oauth_token_secret")
     screen_name = sanitize(access.get("screen_name") or handle)
 
-    # Confirm identity
     auth = OAuth1(TWITTER_API_KEY, TWITTER_API_SECRET, access_token, access_secret)
     try:
         vr = requests.get(VERIFY_URL, auth=auth, params={"skip_status": "true"}, timeout=20)
@@ -648,7 +629,6 @@ def login():
         name, bio = screen_name, "Flock member"
 
     now = time.time()
-    # Move row to verified handle if X returned a different screen_name
     if screen_name != handle:
         existing = get_user(screen_name)
         if existing is None:
@@ -725,9 +705,5 @@ def api_start():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3333"))
-    print(f"Flock  http://0.0.0.0:{port}  db={DB_PATH}  twitter={twitter_configured()}")
-    if SECRET_KEY == "dev-only-change-me":
-        print("WARNING: set FLOCK_SECRET before public deploy.")
-    if not twitter_configured():
-        print("WARNING: set TWITTER_API_KEY and TWITTER_API_SECRET.")
+    print(f"Flock  http://0.0.0.0:{port}  db={DB_PATH}")
     app.run(host="0.0.0.0", port=port, debug=False)
